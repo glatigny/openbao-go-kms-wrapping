@@ -83,6 +83,9 @@ const (
 
 	CryptoAesGcmNonceSize = 12
 	CryptoAesGcmOverhead  = 16
+
+	CryptoAesCcmNonceSize = 12
+	CryptoAesCcmMacSize = 12
 )
 
 func newPkcs11Client(opts *options) (*Pkcs11Client, *wrapping.WrapperConfig, error) {
@@ -277,6 +280,8 @@ func (c *Pkcs11Client) Encrypt(plaintext []byte) ([]byte, []byte, *Pkcs11Key, er
 	switch mechanism {
 	case pkcs11.CKM_AES_GCM:
 		return c.EncryptAesGcm(session, key, keyId, plaintext)
+	case pkcs11.CKM_AES_CCM:
+		return c.EncryptAesCcm(session, key, keyId, plaintext)
 	case pkcs11.CKM_RSA_PKCS_OAEP:
 		return c.EncryptRsaOaep(session, key, keyId, plaintext)
 	}
@@ -310,6 +315,31 @@ func (c *Pkcs11Client) EncryptAesGcm(session pkcs11.SessionHandle, key pkcs11.Ob
 	if len(ciphertext) == CryptoAesGcmNonceSize+len(plaintext)+CryptoAesGcmOverhead {
 		nonce = ciphertext[len(ciphertext)-CryptoAesGcmNonceSize:]
 		ciphertext = ciphertext[:len(ciphertext)-CryptoAesGcmNonceSize]
+	}
+
+	return ciphertext, nonce, &keyId, nil
+}
+
+// Encryption for AES CCM algorithm
+func (c *Pkcs11Client) EncryptAesCcm(session pkcs11.SessionHandle, key pkcs11.ObjectHandle, keyId Pkcs11Key, plaintext []byte) ([]byte, []byte, *Pkcs11Key, error) {
+	nonce, err := c.client.GenerateRandom(session, CryptoAesCcmNonceSize)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Some HSM will ignore the given nonce and generate their own.
+	// That's why we need to free manually the GCM parameters.
+	params := pkcs11.NewCCMParams(nonce, nil, len(plaintext), CryptoAesCcmMacSize)
+	defer params.Free()
+
+	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_CCM, params)}
+
+	if err = c.client.EncryptInit(session, mech, key); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to pkcs11 EncryptInit: %s", err)
+	}
+	var ciphertext []byte
+	if ciphertext, err = c.client.Encrypt(session, plaintext); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to pkcs11 Encrypt: %s", err)
 	}
 
 	return ciphertext, nonce, &keyId, nil
@@ -364,6 +394,8 @@ func (c *Pkcs11Client) Decrypt(ciphertext []byte, nonce []byte, keyId *Pkcs11Key
 	switch mechanism {
 	case pkcs11.CKM_AES_GCM:
 		return c.DecryptAesGcm(session, key, nonce, ciphertext)
+	case pkcs11.CKM_AES_CCM:
+		return c.DecryptAesCcm(session, key, nonce, ciphertext)
 	case pkcs11.CKM_RSA_PKCS_OAEP:
 		return c.DecryptRsaOaep(session, key, nonce, ciphertext)
 	}
@@ -375,6 +407,23 @@ func (c *Pkcs11Client) DecryptAesGcm(session pkcs11.SessionHandle, key pkcs11.Ob
 	defer params.Free()
 
 	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, params)}
+
+	var err error
+	if err = c.client.DecryptInit(session, mech, key); err != nil {
+		return nil, fmt.Errorf("failed to pkcs11 DecryptInit: %s", err)
+	}
+	var decrypted []byte
+	if decrypted, err = c.client.Decrypt(session, ciphertext); err != nil {
+		return nil, fmt.Errorf("failed to pkcs11 Decrypt: %s", err)
+	}
+	return decrypted, nil
+}
+
+func (c *Pkcs11Client) DecryptAesCcm(session pkcs11.SessionHandle, key pkcs11.ObjectHandle, nonce []byte, ciphertext []byte) ([]byte, error) {
+	params := pkcs11.NewCCMParams(nonce, nil, len(ciphertext), CryptoAesCcmMacSize)
+	defer params.Free()
+
+	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_CCM, params)}
 
 	var err error
 	if err = c.client.DecryptInit(session, mech, key); err != nil {
@@ -562,6 +611,8 @@ func GetKeyTypeFromMech(mech uint) (uint, error) {
 		return pkcs11.CKK_RSA, nil
 	case pkcs11.CKM_AES_GCM:
 		return pkcs11.CKK_AES, nil
+	case pkcs11.CKM_AES_CCM:
+		return pkcs11.CKK_AES, nil
 	// Deprecated mechanisms
 	case pkcs11.CKM_RSA_PKCS, pkcs11.CKM_AES_CBC, pkcs11.CKM_AES_CBC_PAD:
 		return 0, fmt.Errorf("deprecated mechanism: %s (%d)", MechanismString(mech), mech)
@@ -577,6 +628,8 @@ func MechanismString(mech uint) string {
 		return "CKM_RSA_PKCS_OAEP"
 	case pkcs11.CKM_AES_GCM:
 		return "CKM_AES_GCM"
+	case pkcs11.CKM_AES_CCM:
+		return "CKM_AES_CCM"
 	// Deprecated mechanisms
 	case pkcs11.CKM_RSA_PKCS:
 		return "CKM_RSA_PKCS"
@@ -595,6 +648,8 @@ func MechanismFromString(mech string) (uint64, error) {
 		return pkcs11.CKM_RSA_PKCS_OAEP, nil
 	case "CKM_AES_GCM", "AES_GCM":
 		return pkcs11.CKM_AES_GCM, nil
+	case "CKM_AES_CCM", "AES_CCM":
+		return pkcs11.CKM_AES_CCM, nil
 	// Deprecated mechanisms
 	case "CKM_RSA_PKCS", "RSA_PKCS", "CKM_AES_CBC_PAD", "AES_CBC_PAD":
 		return 0, fmt.Errorf("deprecated mechanism: %s", mech)
